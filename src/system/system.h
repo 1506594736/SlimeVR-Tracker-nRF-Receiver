@@ -11,6 +11,7 @@
 // 0-255 -> id 3-258
 
 #define RF_CHANNEL 259  // NVS key for receiver RF channel
+#define WIRELESS_STANDBY_MASK 260 // NVS bitmask of trackers awaiting wireless wake
 
 uint8_t reboot_counter_read(void);
 void reboot_counter_write(uint8_t reboot_counter);

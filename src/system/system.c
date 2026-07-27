@@ -277,11 +277,16 @@ static void button_thread(void)
 
 			switch (num_presses)
 			{
-			case 1: // Shutdown all active trackers
-				LOG_INF("Shutdown all trackers requested");
-				esb_request_all_shutdown();
-				set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
+			case 1: { // Toggle wireless standby for active/previously-standby trackers
+				LOG_INF("Wireless standby toggle requested");
+				bool waking = esb_wireless_standby_pending();
+				esb_toggle_wireless_standby();
+				set_led(
+					waking ? SYS_LED_PATTERN_ONESHOT_POWERON : SYS_LED_PATTERN_ONESHOT_POWEROFF,
+					SYS_LED_PRIORITY_HIGHEST
+				);
 				break;
+			}
 
 			case 2: // Exit pairing mode
 				LOG_INF("Exit pairing mode requested");

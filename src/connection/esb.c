@@ -120,6 +120,12 @@ static uint8_t packet_count[MAX_TRACKERS] = {0};             // Packet count rec
 // Shared ACK state: written by threads/event_handler, read by ack_handler (radio ISR).
 // On single-core Cortex-M, volatile ensures visibility between ISR priorities.
 static volatile uint8_t tracker_remote_command[MAX_TRACKERS]; // Command flag for next PONG
+static atomic_t wireless_standby_mask = ATOMIC_INIT(0);
+static atomic_t wireless_standby_mask_dirty = ATOMIC_INIT(0);
+/* Keep the standby set after a failed wake, but do not let it block later SW0 presses. */
+static atomic_t wireless_standby_mode = ATOMIC_INIT(0);
+static atomic_t wireless_wake_in_progress = ATOMIC_INIT(0);
+static atomic_t wireless_wake_started_ms = ATOMIC_INIT(0);
 static volatile uint32_t tracker_channel_value;               // Channel value for SET_CHANNEL command
 static volatile int16_t pending_sens_data[MAX_TRACKERS][3];   // SENS_SET sensitivity data
 static volatile uint8_t pending_sens_auto_axis[MAX_TRACKERS];
@@ -128,6 +134,7 @@ static uint8_t receiver_rf_channel = 0xFF; // Current RF channel of the receiver
 
 #define PING_TIMEOUT_MS 5000               // PING timeout threshold: 5 seconds
 #define REMOTE_COMMAND_ACTIVE_SCAN_MS 1000 // Time window to detect trackers actively sending data
+#define WIRELESS_WAKE_TIMEOUT_MS 10000     // Do not let one missing tracker block the SW0 toggle
 
 /**
  * Recalculate dynamic TDMA parameters based on active trackers.
@@ -1588,6 +1595,17 @@ void event_handler(struct esb_evt const *event)
 					if (ping_ack_flag != ESB_PONG_FLAG_NORMAL) {
 						if (tracker_remote_command[tracker_id] == ping_ack_flag) {
 							tracker_remote_command[tracker_id] = ESB_PONG_FLAG_NORMAL;
+							if (ping_ack_flag == ESB_PONG_FLAG_WAKE) {
+								atomic_val_t old_mask = atomic_and(
+									&wireless_standby_mask,
+									~(atomic_val_t)(1u << tracker_id)
+								);
+								atomic_set(&wireless_standby_mask_dirty, 1);
+								if ((old_mask & ~(atomic_val_t)(1u << tracker_id)) == 0) {
+									atomic_set(&wireless_wake_in_progress, 0);
+									atomic_set(&wireless_wake_started_ms, 0);
+								}
+							}
 							/* Confirmations are frequent under load — keep UART off EVENT IRQ. */
 							LOG_DBG(
 								"Tracker %u confirmed command %s (0x%02X)",
@@ -2092,6 +2110,8 @@ void esb_pop_pair(void)
 	k_mutex_unlock(&tracker_store_lock);
 
 	if (removed_id >= 0) {
+		atomic_and(&wireless_standby_mask, ~(atomic_val_t)(1u << removed_id));
+		atomic_set(&wireless_standby_mask_dirty, 1);
 		uint8_t count = stored_trackers;
 		nvs_write_async(STORED_TRACKERS, &count, sizeof(count));
 		uint64_t zero_addr = 0;
@@ -2226,6 +2246,11 @@ void esb_clear(void)
 	__asm__ volatile("" ::: "memory"); // compiler barrier
 	memset(stored_tracker_addr, 0, sizeof(stored_tracker_addr));
 	k_mutex_unlock(&tracker_store_lock);
+	atomic_set(&wireless_standby_mask, 0);
+	atomic_set(&wireless_standby_mask_dirty, 1);
+	atomic_set(&wireless_standby_mode, 0);
+	atomic_set(&wireless_wake_in_progress, 0);
+	atomic_set(&wireless_wake_started_ms, 0);
 
 	// Async NVS writes
 	uint8_t zero_count = 0;
@@ -2372,6 +2397,10 @@ static const char *esb_pong_flag_name(uint8_t flag)
 		return "MAG_AUTO_ON";
 	case ESB_PONG_FLAG_MAG_AUTO_OFF:
 		return "MAG_AUTO_OFF";
+	case ESB_PONG_FLAG_STANDBY:
+		return "STANDBY";
+	case ESB_PONG_FLAG_WAKE:
+		return "WAKE";
 	case ESB_PONG_FLAG_REBOOT:
 		return "REBOOT";
 	case ESB_PONG_FLAG_CLEAR:
@@ -2503,6 +2532,80 @@ uint32_t esb_send_remote_command_all(uint8_t command_flag)
 		count > 0 ? active_tracker_ids : "none"
 	);
 	return mask;
+}
+
+uint32_t esb_toggle_wireless_standby(void)
+{
+	uint32_t standby_mask = (uint32_t)atomic_get(&wireless_standby_mask);
+	if (atomic_get(&wireless_wake_in_progress)) {
+		/* A repeated press during the 10-second window retries the same wake command. */
+		for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+			if (standby_mask & (1u << i)) {
+				tracker_remote_command[i] = ESB_PONG_FLAG_WAKE;
+			}
+		}
+		atomic_set(&wireless_wake_started_ms, (atomic_val_t)(uint32_t)k_uptime_get());
+		LOG_INF("Wireless wake retry queued for tracker mask 0x%08X", standby_mask);
+		return standby_mask;
+	}
+
+	if (atomic_get(&wireless_standby_mode) && standby_mask != 0) {
+		for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+			if (standby_mask & (1u << i)) {
+				tracker_remote_command[i] = ESB_PONG_FLAG_WAKE;
+			}
+		}
+		atomic_set(&wireless_standby_mode, 0);
+		atomic_set(&wireless_wake_in_progress, 1);
+		atomic_set(&wireless_wake_started_ms, (atomic_val_t)(uint32_t)k_uptime_get());
+		LOG_INF("Wireless wake queued for tracker mask 0x%08X", standby_mask);
+		return standby_mask;
+	}
+	atomic_set(&wireless_standby_mode, 0);
+
+	uint32_t active_mask = esb_send_remote_command_all(ESB_PONG_FLAG_STANDBY);
+	if (active_mask != 0) {
+		/* Retain trackers that did not answer the previous wake so a later wake retries them. */
+		atomic_or(&wireless_standby_mask, (atomic_val_t)active_mask);
+		atomic_set(&wireless_standby_mask_dirty, 1);
+		atomic_set(&wireless_standby_mode, 1);
+	}
+	return active_mask;
+}
+
+bool esb_wireless_standby_pending(void)
+{
+	return atomic_get(&wireless_standby_mode) || atomic_get(&wireless_wake_in_progress);
+}
+
+static void wireless_wake_timeout_check(void)
+{
+	if (!atomic_get(&wireless_wake_in_progress)) {
+		return;
+	}
+
+	uint32_t started = (uint32_t)atomic_get(&wireless_wake_started_ms);
+	uint32_t now = (uint32_t)k_uptime_get();
+	if ((uint32_t)(now - started) < WIRELESS_WAKE_TIMEOUT_MS) {
+		return;
+	}
+
+	uint32_t missing_mask = (uint32_t)atomic_get(&wireless_standby_mask);
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if ((missing_mask & (1u << i)) && tracker_remote_command[i] == ESB_PONG_FLAG_WAKE) {
+			tracker_remote_command[i] = ESB_PONG_FLAG_NORMAL;
+		}
+	}
+
+	atomic_set(&wireless_wake_in_progress, 0);
+	atomic_set(&wireless_wake_started_ms, 0);
+	if (missing_mask != 0) {
+		LOG_WRN(
+			"Wireless wake timed out after %d ms; tracker mask 0x%08X remains in standby",
+			WIRELESS_WAKE_TIMEOUT_MS,
+			missing_mask
+		);
+	}
 }
 
 // Manually print statistics for all active trackers
@@ -2719,6 +2822,16 @@ static void esb_thread(void)
 		}
 	}
 
+	uint32_t saved_standby_mask = 0;
+	sys_read(WIRELESS_STANDBY_MASK, &saved_standby_mask, sizeof(saved_standby_mask));
+	uint32_t paired_mask = (tracker_count < 32) ? ((1u << tracker_count) - 1u) : 0xFFFFFFFFu;
+	uint32_t restored_standby_mask = saved_standby_mask & paired_mask;
+	atomic_set(&wireless_standby_mask, (atomic_val_t)restored_standby_mask);
+	atomic_set(&wireless_standby_mode, restored_standby_mask != 0);
+	if (saved_standby_mask != 0) {
+		LOG_INF("Loaded wireless standby tracker mask 0x%08X", restored_standby_mask);
+	}
+
 	LOG_INF("%d/%d devices stored", tracker_count, MAX_TRACKERS);
 
 	/* Pre-fill TDMA config based on stored tracker count so trackers
@@ -2774,6 +2887,13 @@ static void esb_thread(void)
 	}
 
 	while (1) {
+		wireless_wake_timeout_check();
+
+		if (atomic_cas(&wireless_standby_mask_dirty, 1, 0)) {
+			uint32_t standby_mask = (uint32_t)atomic_get(&wireless_standby_mask);
+			nvs_write_async(WIRELESS_STANDBY_MASK, &standby_mask, sizeof(standby_mask));
+		}
+
 		// Process new device pairing requests (non-blocking)
 		if (esb_pairing) {
 			process_pairing_queue();
