@@ -21,3 +21,8 @@ CONFIG_BUILD_OUTPUT_UF2=y
 CONFIG_BUILD_OUTPUT_UF2_FAMILY_ID="0x621e937a"
 CONFIG_RADIO_TX_POWER=30
 
+# Field diagnostics for the console health snapshot: per-tracker RSSI and
+# phase histograms, PING bias/skew tracking, and RF error counters.
+# Does not change TDMA scheduling or loss control, only adds instrumentation.
+CONFIG_TDMA_DIAGNOSTICS=y
+
